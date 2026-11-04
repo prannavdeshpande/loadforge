@@ -4,17 +4,22 @@ A distributed load generator written in Go, kept in one repo (monorepo). **Measu
 
 ## Commands
 
-| Command | What it does |
+We use plain Go and Docker commands; there is no Makefile.
+
+| Step | Command |
 |---|---|
-| `make up` | Starts Postgres, Redis, NATS and Kafka (`deploy/compose/docker-compose.yml`), waits until they're healthy and creates the Kafka topics |
-| `make down` | Stops the stack and **deletes its volumes** |
-| `make test` | Unit tests: `go test -race ./...` |
-| `make test-integration` | Integration tests (`-tags=integration`); run `make up` first |
-| `make lint` | gofmt check, `go vet` and golangci-lint (pinned version, installed into `./bin`) |
+| Unit tests | `go test -race ./...` (add `-short` to skip the ~25s coordinated-omission tests while iterating) |
+| Lint | `gofmt -l .` (must print nothing), `go vet ./...`, `GOTOOLCHAIN=go1.23.0 go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0 run ./...` |
+| Start stack | `docker compose -f deploy/compose/docker-compose.yml up -d --wait`, then create the topic: `docker compose -f deploy/compose/docker-compose.yml exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --create --if-not-exists --topic loadforge.hdr.snapshots --partitions 12 --replication-factor 1` |
+| Integration tests | `go test -race -tags=integration ./...` (start the stack first) |
+| Stop stack | `docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans` (**deletes its volumes**) |
+| Stub target | `go run ./cmd/calibrate serve -addr :8080 -latency 1ms`; stall it with `curl -X POST 'localhost:8080/_stall?d=2s'` |
+
+Run the timing tests on an otherwise idle machine. They assert on dispatch lag, and a parallel build can starve the scheduler and fail them.
 
 ## Workflow
 
-1. Run `make lint test` before you call any change done. If you touched `internal/store`, `internal/transport` or a protocol, also run `make up && make test-integration`.
+1. Run lint and unit tests (above) before you call any change done. If you touched `internal/store`, `internal/transport` or a protocol, also start the stack and run the integration tests.
 2. A change to scheduling, timing or histogram code needs a test that proves there's no coordinated omission. The standard case: the stubbed server stalls for N seconds, and the test asserts that the recorded latencies cover the stall instead of hiding it.
 3. Schema changes go in a new migration under `internal/store/migrations/`. Never edit a migration that has already been applied.
 4. Adding infrastructure, a message type or a Kafka topic means updating `docs/design.md` in the same change.
@@ -27,6 +32,7 @@ A distributed load generator written in Go, kept in one repo (monorepo). **Measu
 - `cmd/aggregator`: consumes snapshots, merges histograms, writes results to Postgres
 - `cmd/calibrate`: measures a host's generator capacity and scheduler jitter baseline
 - `internal/engine`: scheduler and request execution
+- `internal/stubserver`: HTTP target with configurable latency and injectable stalls, for coordinated-omission tests
 - `internal/health`: generator health signals that feed the verdict engine
 - `internal/runstate`: run state machine, persisted in Postgres
 - `internal/safety`: dead-man's switch, rate caps, abort paths
