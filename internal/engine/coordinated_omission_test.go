@@ -87,10 +87,11 @@ func testStallAppearsInTail(t *testing.T, maxInFlight, queueDepth int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := e.Run(context.Background(), t0)
+	out, err := e.Run(context.Background(), t0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	res := out.Total
 	checkAccounting(t, res)
 
 	want := int64(coRate * coDuration / time.Second)
@@ -150,4 +151,83 @@ func TestClosedLoop_HidesStall_Contrast(t *testing.T) {
 		t.Errorf("closed-loop p99 = %v; expected it to hide the stall (< 100ms)", p99)
 	}
 	t.Logf("closed loop: sent=%d p99=%v max=%v", h.TotalCount(), p(h, 99), dur(h.Max()))
+}
+
+// TestGracefulStopDuringStall_RecordsStall stops the run in the middle of the
+// standard stall, as STOP or the dead-man's switch does. The requests held by
+// the frozen server must drain and record their full latency rather than be
+// cut off, and the stall must be visible in the per-interval histograms the
+// worker publishes, not only in the run totals.
+//
+// Stop at 2.5s: requests intended in [0, 2.5s) are released, ≈ 250. The 100
+// intended during the stall, t_i ∈ [1.5s, 2.5s), complete at ~3.5s with
+// latencies from ~2s down to ~1s, so p99 (the top 2–3 values) is ≈ 1.98s.
+func TestGracefulStopDuringStall_RecordsStall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for ~8s")
+	}
+	for _, c := range []struct {
+		name                    string
+		maxInFlight, queueDepth int
+	}{
+		{"ample capacity", 1000, 0},
+		// At the stop, 50 requests are blocked in flight and ~50 wait in
+		// the queue. Draining must still execute the queued ones.
+		{"in-flight cap reached", 50, 1000},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			testGracefulStopDuringStall(t, c.maxInFlight, c.queueDepth)
+		})
+	}
+}
+
+func testGracefulStopDuringStall(t *testing.T, maxInFlight, queueDepth int) {
+	const stopAt = 2500 * time.Millisecond
+	t0 := time.Now().Add(100 * time.Millisecond)
+	srv := startStalledServer(t, t0)
+
+	e, err := New(Config{
+		Rate: coRate, Duration: time.Hour,
+		MaxInFlight: maxInFlight, QueueDepth: queueDepth,
+		RequestTimeout: 10 * time.Second, DrainTimeout: 10 * time.Second,
+	}, &HTTPDoer{Client: newClient(t), Method: http.MethodGet, URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := time.AfterFunc(time.Until(t0.Add(stopAt)), e.Stop)
+	t.Cleanup(func() { stop.Stop() })
+	rotated := rotateOnGrid(e, t0, time.Second)
+
+	res, err := e.Run(context.Background(), t0)
+	if err != nil {
+		t.Fatalf("Run after Stop: %v, want nil", err)
+	}
+	checkAccounting(t, res.Total)
+	merged := checkIntervalsCoverRun(t, t0, <-rotated, res)
+
+	if merged.Intended < 248 || merged.Intended > 252 {
+		t.Errorf("intended = %d, want ≈ 250 (released before the stop at %v)", merged.Intended, stopAt)
+	}
+	if merged.OK != merged.Intended || merged.Unfinished != 0 || merged.Dropped != 0 {
+		t.Errorf("ok=%d unfinished=%d dropped=%d of %d: Stop cut off requests held by the stall",
+			merged.OK, merged.Unfinished, merged.Dropped, merged.Intended)
+	}
+	if p99 := p(merged.Latency, 99); p99 < 1800*time.Millisecond {
+		t.Errorf("latency p99 = %v, want ≥ 1.8s: the 2s stall is hidden", p99)
+	}
+	if max := dur(merged.Latency.Max()); max < 1950*time.Millisecond || max > 2200*time.Millisecond {
+		t.Errorf("latency max = %v, want ≈ 2s (1.95s–2.2s)", max)
+	}
+	if n := countAtLeast(merged.Latency, time.Second); n < 90 || n > 110 {
+		t.Errorf("%d requests ≥ 1s, want ≈ 100 (90–110): the stall's shape is wrong", n)
+	}
+	if end := res.Final.End.Sub(t0); end < coStallAt+coStall {
+		t.Errorf("run ended at %v, before the stall cleared at %v: it did not drain", end, coStallAt+coStall)
+	}
+	if lag := p(merged.DispatchLag, 99); lag > healthyLagP99 {
+		t.Errorf("dispatch lag p99 = %v, want ≤ %v", lag, healthyLagP99)
+	}
+	t.Logf("graceful stop: intended=%d p99=%v max=%v ≥1s=%d final=[%v, %v]",
+		merged.Intended, p(merged.Latency, 99), dur(merged.Latency.Max()),
+		countAtLeast(merged.Latency, time.Second), res.Final.Start.Sub(t0), res.Final.End.Sub(t0))
 }
