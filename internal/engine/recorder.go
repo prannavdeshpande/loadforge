@@ -85,14 +85,14 @@ type recorder struct {
 	exec     []*shard
 
 	rotateMu sync.Mutex
+	open     bool // between start and finish
 	last     time.Time
 	total    *Interval
 }
 
-func newRecorder(execShards int, now time.Time) *recorder {
+func newRecorder(execShards int) *recorder {
 	r := &recorder{
 		dispatch: newShard(func() *Interval { return &Interval{DispatchLag: NewHistogram()} }),
-		last:     now,
 		total:    newInterval(),
 	}
 	for range execShards {
@@ -103,12 +103,36 @@ func newRecorder(execShards int, now time.Time) *recorder {
 	return r
 }
 
-// rotate closes the current interval at now and returns it. Every value
-// recorded before the swap of a shard lands in exactly one interval.
-func (r *recorder) rotate(now time.Time) Interval {
+// start opens the first interval at t0. Nothing is recorded before start.
+func (r *recorder) start(t0 time.Time) {
 	r.rotateMu.Lock()
 	defer r.rotateMu.Unlock()
+	r.last, r.open = t0, true
+}
 
+// rotate closes the current interval at now and returns it. Every value
+// recorded before the swap of a shard lands in exactly one interval. ok is
+// false outside start..finish.
+func (r *recorder) rotate(now time.Time) (iv Interval, ok bool) {
+	r.rotateMu.Lock()
+	defer r.rotateMu.Unlock()
+	if !r.open {
+		return Interval{}, false
+	}
+	return r.rotateLocked(now), true
+}
+
+// finish closes the last interval at now and returns it. Later rotations
+// report nothing.
+func (r *recorder) finish(now time.Time) Interval {
+	r.rotateMu.Lock()
+	defer r.rotateMu.Unlock()
+	iv := r.rotateLocked(now)
+	r.open = false
+	return iv
+}
+
+func (r *recorder) rotateLocked(now time.Time) Interval {
 	out := newInterval()
 	out.Start, out.End = r.last, now
 	r.last = now

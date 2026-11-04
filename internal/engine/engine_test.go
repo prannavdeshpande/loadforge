@@ -63,8 +63,8 @@ func run(t *testing.T, t0 time.Time, cfg Config, d Doer, setup func(*Engine)) In
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	checkAccounting(t, res)
-	return res
+	checkAccounting(t, res.Total)
+	return res.Total
 }
 
 func checkAccounting(t *testing.T, r Interval) {
@@ -240,10 +240,11 @@ func TestAbortStopsDispatching(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	res, err := e.Run(ctx, time.Now())
+	out, err := e.Run(ctx, time.Now())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run error = %v, want deadline exceeded", err)
 	}
+	res := out.Total
 	checkAccounting(t, res)
 	if res.Unfinished == 0 {
 		t.Error("unfinished = 0, want the aborted in-flight requests counted")

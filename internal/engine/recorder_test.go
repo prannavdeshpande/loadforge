@@ -40,7 +40,8 @@ func TestHistogramRangeAndClamp(t *testing.T) {
 
 func TestRotateLosesNothingUnderConcurrency(t *testing.T) {
 	const writers, perWriter = 8, 20_000
-	r := newRecorder(4, time.Now())
+	r := newRecorder(4)
+	r.start(time.Now())
 
 	var (
 		wg      sync.WaitGroup
@@ -51,7 +52,8 @@ func TestRotateLosesNothingUnderConcurrency(t *testing.T) {
 	go func() {
 		defer close(rotDone)
 		for !stop.Load() {
-			rotated += r.rotate(time.Now()).Latency.TotalCount()
+			iv, _ := r.rotate(time.Now())
+			rotated += iv.Latency.TotalCount()
 		}
 	}()
 	for w := range writers {
@@ -69,7 +71,7 @@ func TestRotateLosesNothingUnderConcurrency(t *testing.T) {
 	wg.Wait()
 	stop.Store(true)
 	<-rotDone
-	rotated += r.rotate(time.Now()).Latency.TotalCount()
+	rotated += r.finish(time.Now()).Latency.TotalCount()
 
 	if rotated != writers*perWriter {
 		t.Errorf("intervals hold %d values, want %d", rotated, writers*perWriter)
