@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/HdrHistogram/hdrhistogram-go"
+
+	"github.com/loadforge/loadforge/internal/timingtest"
 )
 
 // Bound on dispatch lag p99 when the dispatcher is healthy. Well above
@@ -87,6 +89,7 @@ func dur(us int64) time.Duration { return time.Duration(us) * time.Microsecond }
 func p(h *hdrhistogram.Histogram, q float64) time.Duration { return dur(h.ValueAtQuantile(q)) }
 
 func TestDispatcherDoesNotWaitOnResponses(t *testing.T) {
+	timingtest.Exclusive(t) // asserts on dispatch lag: never alongside another such test
 	// Every response is held until 1.2s, past the end of the 1s schedule. A
 	// closed-loop dispatcher would release one request; this one must release
 	// all 200 on time.
@@ -142,6 +145,7 @@ func TestOverdueRequestsReleasedNotSkipped(t *testing.T) {
 }
 
 func TestLatencyMeasuredFromIntendedTime(t *testing.T) {
+	timingtest.Exclusive(t) // asserts on dispatch lag: never alongside another such test
 	// One executor, 50ms service time, a request every 10ms: requests queue
 	// behind the cap. Request k completes at ~(k+1)·50ms but was intended at
 	// k·10ms, so latency grows to ~2s. Measuring from the actual send would

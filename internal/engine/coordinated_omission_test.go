@@ -10,6 +10,7 @@ import (
 	"github.com/HdrHistogram/hdrhistogram-go"
 
 	"github.com/loadforge/loadforge/internal/stubserver"
+	"github.com/loadforge/loadforge/internal/timingtest"
 )
 
 // The standard coordinated-omission scenario (CLAUDE.md, workflow rule 2):
@@ -58,6 +59,7 @@ func TestOpenLoop_TwoSecondStallAppearsInTail(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs for ~12s")
 	}
+	timingtest.Exclusive(t) // asserts on dispatch lag: never alongside another such test
 	for _, c := range []struct {
 		name                    string
 		maxInFlight, queueDepth int
@@ -127,6 +129,7 @@ func TestClosedLoop_HidesStall_Contrast(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs for ~6s")
 	}
+	timingtest.Exclusive(t) // asserts on dispatch lag: never alongside another such test
 	t0 := time.Now().Add(100 * time.Millisecond)
 	srv := startStalledServer(t, t0)
 	doer := &HTTPDoer{Client: newClient(t), Method: http.MethodGet, URL: srv.URL}
@@ -166,6 +169,7 @@ func TestGracefulStopDuringStall_RecordsStall(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs for ~8s")
 	}
+	timingtest.Exclusive(t) // asserts on dispatch lag: never alongside another such test
 	for _, c := range []struct {
 		name                    string
 		maxInFlight, queueDepth int

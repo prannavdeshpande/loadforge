@@ -16,8 +16,8 @@ import (
 const SnapshotTopic = "loadforge.hdr.snapshots"
 
 // SnapshotVersion is the payload version written by Encode. Decode rejects
-// any other.
-const SnapshotVersion = 1
+// any other. Version 2 added the required interval_ns field.
+const SnapshotVersion = 2
 
 // StopReason says why a worker's stream ended. It is set only on the final
 // snapshot.
@@ -49,6 +49,9 @@ type Snapshot struct {
 	Seq      uint64 // contiguous from 0 for each (RunID, WorkerID)
 
 	IntervalStart, IntervalEnd time.Time
+	// IntervalNS is the interval's length on the worker's monotonic clock.
+	// Rates are computed from it, never from the wall-clock labels.
+	IntervalNS int64
 
 	Latency     *hdrhistogram.Histogram // completion − intended send time
 	SendDelay   *hdrhistogram.Histogram // execution start − intended send time
@@ -84,6 +87,9 @@ func (s *Snapshot) Validate() error {
 	// decoder accepts everything the encoder does.
 	if s.IntervalStart.IsZero() || s.IntervalEnd.UnixNano() < s.IntervalStart.UnixNano() {
 		return fmt.Errorf("transport: snapshot interval [%v, %v] is invalid", s.IntervalStart, s.IntervalEnd)
+	}
+	if s.IntervalNS < 0 {
+		return fmt.Errorf("transport: snapshot interval_ns %d is negative", s.IntervalNS)
 	}
 	for _, h := range []struct {
 		name string
@@ -156,6 +162,7 @@ const (
 	fClamped       protowire.Number = 16
 	fFinal         protowire.Number = 17
 	fReason        protowire.Number = 18
+	fIntervalNS    protowire.Number = 19 // monotonic length, required since version 2
 )
 
 // EncodeSnapshot validates s and serialises it.
@@ -179,6 +186,7 @@ func EncodeSnapshot(s *Snapshot) ([]byte, error) {
 	varint(fSeq, s.Seq)
 	sint(fIntervalStart, s.IntervalStart.UnixNano())
 	sint(fIntervalEnd, s.IntervalEnd.UnixNano())
+	sint(fIntervalNS, s.IntervalNS)
 	for _, h := range []struct {
 		n protowire.Number
 		h *hdrhistogram.Histogram
@@ -221,7 +229,7 @@ func DecodeSnapshot(b []byte) (*Snapshot, error) {
 		b = b[n:]
 		// Known fields are singular. Unknown ones may be repeated in a
 		// later version.
-		if seen[num] && num >= fVersion && num <= fReason {
+		if seen[num] && num >= fVersion && num <= fIntervalNS {
 			return nil, fmt.Errorf("transport: snapshot: field %d repeated", num)
 		}
 		seen[num] = true
@@ -281,6 +289,8 @@ func DecodeSnapshot(b []byte) (*Snapshot, error) {
 			s.Final, err = v == 1, wantType(num, typ, protowire.VarintType)
 		case fReason:
 			s.Reason, err = StopReason(raw), wantType(num, typ, protowire.BytesType)
+		case fIntervalNS:
+			s.IntervalNS, err = sint64(num, typ, v)
 		}
 		if err != nil {
 			return nil, err
@@ -291,6 +301,9 @@ func DecodeSnapshot(b []byte) (*Snapshot, error) {
 	}
 	if !seen[fIntervalStart] || !seen[fIntervalEnd] {
 		return nil, errors.New("transport: snapshot interval is missing")
+	}
+	if !seen[fIntervalNS] {
+		return nil, errors.New("transport: snapshot interval_ns is missing")
 	}
 	s.IntervalStart, s.IntervalEnd = time.Unix(0, start), time.Unix(0, end)
 	if err := s.Validate(); err != nil {
@@ -313,22 +326,52 @@ func sint64(num protowire.Number, typ protowire.Type, v uint64) (int64, error) {
 	return protowire.DecodeZigZag(v), nil
 }
 
-// decodeHist guards hdrhistogram.Decode, which panics on short input.
-func decodeHist(num protowire.Number, typ protowire.Type, raw []byte) (h *hdrhistogram.Histogram, err error) {
+// decodeHist decodes a histogram field. Its range is checked by Validate.
+func decodeHist(num protowire.Number, typ protowire.Type, raw []byte) (*hdrhistogram.Histogram, error) {
 	if err := wantType(num, typ, protowire.BytesType); err != nil {
 		return nil, err
 	}
-	if base64.StdEncoding.DecodedLen(len(raw)) < 8 {
-		return nil, fmt.Errorf("transport: snapshot field %d: histogram too short", num)
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			h, err = nil, fmt.Errorf("transport: snapshot field %d: corrupt histogram: %v", num, r)
-		}
-	}()
-	h, err = hdrhistogram.Decode(raw)
+	h, err := decodeHDR(raw)
 	if err != nil {
 		return nil, fmt.Errorf("transport: snapshot field %d: %w", num, err)
 	}
 	return h, nil
+}
+
+// DecodeHistogram decodes an HDR V2 compressed histogram (the encoding
+// snapshots carry) and checks that it covers the standard range.
+func DecodeHistogram(raw []byte) (*hdrhistogram.Histogram, error) {
+	h, err := decodeHDR(raw)
+	if err != nil {
+		return nil, fmt.Errorf("transport: %w", err)
+	}
+	if err := checkRange("encoded", h); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// EncodeHistogram is the inverse of DecodeHistogram.
+func EncodeHistogram(h *hdrhistogram.Histogram) ([]byte, error) {
+	if err := checkRange("encoded", h); err != nil {
+		return nil, err
+	}
+	b, err := h.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+	if err != nil {
+		return nil, fmt.Errorf("transport: encode histogram: %w", err)
+	}
+	return b, nil
+}
+
+// decodeHDR guards hdrhistogram.Decode, which panics on short input.
+func decodeHDR(raw []byte) (h *hdrhistogram.Histogram, err error) {
+	if base64.StdEncoding.DecodedLen(len(raw)) < 8 {
+		return nil, errors.New("histogram too short")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			h, err = nil, fmt.Errorf("corrupt histogram: %v", r)
+		}
+	}()
+	return hdrhistogram.Decode(raw)
 }

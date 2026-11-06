@@ -159,10 +159,15 @@ func (e *Emitter) emit(ctx context.Context, iv engine.Interval, reason transport
 		defer close(e.out)
 	}
 
+	// Take the length while both ends still carry their monotonic readings:
+	// the labels below are wall-clock only.
+	length := intervalNS(iv)
 	if !e.anchor.IsZero() {
 		iv.Start, iv.End = e.label(iv.Start), e.label(iv.End)
 	}
-	value, err := transport.EncodeSnapshot(toSnapshot(e.runID, e.workerID, seq, iv, reason))
+	snap := toSnapshot(e.runID, e.workerID, seq, iv, reason)
+	snap.IntervalNS = length
+	value, err := transport.EncodeSnapshot(snap)
 	if err != nil {
 		// Not expected: the engine's intervals satisfy the invariants.
 		e.failed.Add(1)
@@ -191,6 +196,16 @@ func (e *Emitter) emit(ctx context.Context, iv engine.Interval, reason transport
 		log.Printf("worker: run %s: final snapshot %d dropped: %v", e.runID, seq, ctx.Err())
 		return seq, nil
 	}
+}
+
+// intervalNS is iv's length on the monotonic clock. The engine stamps both
+// ends with time.Now(), so Sub uses the monotonic readings. An interval
+// without them (a run that never started) has length 0.
+func intervalNS(iv engine.Interval) int64 {
+	if iv.Start.IsZero() || iv.End.IsZero() || iv.End.Before(iv.Start) {
+		return 0
+	}
+	return int64(iv.End.Sub(iv.Start))
 }
 
 func (e *Emitter) label(t time.Time) time.Time {

@@ -28,6 +28,12 @@ func TestDeadManTimeoutBelowLeaseTTL(t *testing.T) {
 	}
 }
 
+func TestLeaseRenewToleratesTwoMissedRenewals(t *testing.T) {
+	if 3*LeaseRenewInterval >= LeaseTTL {
+		t.Fatalf("LeaseRenewInterval %v: three renewal periods reach the %v TTL", LeaseRenewInterval, LeaseTTL)
+	}
+}
+
 func TestDeadManTripsWithoutHeartbeat(t *testing.T) {
 	d, trips := newTestDeadMan(t, 1)
 	time.Sleep(testTimeout / 2)

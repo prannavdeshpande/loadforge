@@ -12,6 +12,9 @@ const (
 	DeadManTimeout    = 5 * time.Second
 	LeaseTTL          = 10 * time.Second // lf:lease:run:{id}, SET NX PX
 	HeartbeatInterval = time.Second
+	// LeaseRenewInterval is how often a holder renews its lease, so that
+	// it survives two failed renewals before expiring.
+	LeaseRenewInterval = 3 * time.Second
 )
 
 // DeadMan trips when no valid controller heartbeat has arrived for its
