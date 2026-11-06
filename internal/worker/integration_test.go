@@ -16,6 +16,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/loadforge/loadforge/internal/engine"
+	"github.com/loadforge/loadforge/internal/kafkatest"
 	"github.com/loadforge/loadforge/internal/stubserver"
 	"github.com/loadforge/loadforge/internal/transport"
 )
@@ -41,7 +42,7 @@ func stackNATS(t *testing.T) *nats.Conn {
 
 func stackKafka(t *testing.T) *KafkaPublisher {
 	t.Helper()
-	pub, err := NewKafkaPublisher([]string{env("LF_KAFKA", "localhost:9092")})
+	pub, err := NewKafkaPublisher(brokers())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,15 +67,23 @@ type record struct {
 	snap      *transport.Snapshot
 }
 
-// consumeRun reads the topic from since and returns runID's records per
+func brokers() []string { return []string{env("LF_KAFKA", "localhost:9092")} }
+
+// endOffsets is where the topic ends now. Take it before the test produces
+// anything and pass it to consumeRun (see kafkatest for why not a timestamp).
+func endOffsets(t *testing.T) map[int32]int64 {
+	t.Helper()
+	return kafkatest.EndOffsets(t, brokers(), transport.SnapshotTopic)
+}
+
+// consumeRun reads the topic from start and returns runID's records per
 // worker, in consumption order, once every worker in want has its final
 // snapshot.
-func consumeRun(t *testing.T, runID string, since time.Time, want []string) map[string][]record {
+func consumeRun(t *testing.T, runID string, start map[int32]int64, want []string) map[string][]record {
 	t.Helper()
 	c, err := kgo.NewClient(
-		kgo.SeedBrokers(env("LF_KAFKA", "localhost:9092")),
-		kgo.ConsumeTopics(transport.SnapshotTopic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AfterMilli(since.Add(-time.Second).UnixMilli())),
+		kgo.SeedBrokers(brokers()...),
+		kafkatest.ConsumeFrom(transport.SnapshotTopic, start),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +153,7 @@ func checkRecords(t *testing.T, worker string, rs []record, reason transport.Sto
 func TestIntegrationKafkaOrderingPerWorker(t *testing.T) {
 	pub := stackKafka(t)
 	runID := uniqueRun("kafka")
-	since := time.Now()
+	start := endOffsets(t)
 	workers := []string{"w1", "w2", "w3"}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -159,7 +168,7 @@ func TestIntegrationKafkaOrderingPerWorker(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got := consumeRun(t, runID, since, workers)
+	got := consumeRun(t, runID, start, workers)
 	for _, w := range workers {
 		checkRecords(t, w, got[w], transport.ReasonCompleted)
 		if len(got[w]) != 16 {
@@ -253,7 +262,7 @@ func TestIntegrationRunWithStallEndToEnd(t *testing.T) {
 	}
 
 	ctl := &controller{t: t, nc: stackNATS(t), runID: uniqueRun("e2e"), fence: 1}
-	since := time.Now()
+	start := endOffsets(t)
 	for id, a := range ctl.send(transport.CmdPrepare, 2, func(c *transport.Command) {
 		c.Prepare = &transport.Prepare{
 			Workers: workers, Method: "GET", TargetURL: srv.URL,
@@ -279,7 +288,7 @@ func TestIntegrationRunWithStallEndToEnd(t *testing.T) {
 	time.Sleep(time.Until(t0.Add(4 * time.Second)))
 
 	stopAcks := ctl.send(transport.CmdStop, 2, nil)
-	got := consumeRun(t, ctl.runID, since, workers)
+	got := consumeRun(t, ctl.runID, start, workers)
 
 	lat := engine.NewHistogram()
 	var intended, ok int64

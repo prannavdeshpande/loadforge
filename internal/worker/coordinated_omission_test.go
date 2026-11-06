@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/loadforge/loadforge/internal/engine"
+	"github.com/loadforge/loadforge/internal/timingtest"
 	"github.com/loadforge/loadforge/internal/transport"
 )
 
@@ -18,6 +19,7 @@ func TestSnapshotsCarryTheStall(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs for ~5s")
 	}
+	timingtest.Exclusive(t) // asserts on dispatch lag: never alongside another such test
 	h := newHarness(t, &memPub{}, func(c *Config) { c.SnapshotPeriod = time.Second })
 	expectStatus(t, h.send(h.prepare("run-co", 1, 1, func(p *transport.Prepare) {
 		p.Rate, p.MaxInFlight, p.QueueDepth = 100, 50, 1000 // the cap is reached during the stall

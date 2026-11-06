@@ -25,6 +25,7 @@ func validSnapshot() *Snapshot {
 	return &Snapshot{
 		RunID: "run-1", WorkerID: "w_7", Seq: 42,
 		IntervalStart: start, IntervalEnd: start.Add(time.Second),
+		IntervalNS:  int64(time.Second) + 417, // monotonic; need not match the labels
 		Latency:     histOf(900, 2_000_000, 1_500, 60_000_000),
 		SendDelay:   histOf(10, 20, 30, 40),
 		DispatchLag: histOf(1, 2, 3, 4, 5),
@@ -125,20 +126,30 @@ func TestSnapshotDecodeRejectsBadInput(t *testing.T) {
 		}
 		return out
 	}
-	// Rewrites the version, which Encode always writes first.
-	withVersion := func(v uint64) []byte {
-		_, _, n := protowire.ConsumeTag(good)
-		_, m := protowire.ConsumeVarint(good[n:])
-		b := protowire.AppendTag(nil, fVersion, protowire.VarintType)
-		b = protowire.AppendVarint(b, v)
-		return append(b, good[n+m:]...)
+	withVersion := func(v uint64) []byte { return setVersion(good, v) }
+	// dropField removes a field, as a version 1 worker would have sent it.
+	dropField := func(n protowire.Number) []byte {
+		var out []byte
+		for b := good; len(b) > 0; {
+			num, typ, tn := protowire.ConsumeTag(b)
+			fn := protowire.ConsumeFieldValue(num, typ, b[tn:])
+			if num != n {
+				out = append(out, b[:tn+fn]...)
+			}
+			b = b[tn+fn:]
+		}
+		return out
 	}
+	// A version 1 payload: version 1 and no interval_ns.
+	v1 := setVersion(dropField(fIntervalNS), 1)
 	wideHist, _ := hdrhistogram.New(1, 3_600_000_000, 3).Encode(hdrhistogram.V2CompressedEncodingCookieBase)
 
 	for name, b := range map[string][]byte{
 		"empty":                    nil,
 		"truncated":                good[:len(good)/2],
-		"unknown version":          withVersion(2),
+		"version 1":                v1,
+		"unknown version":          withVersion(3),
+		"no interval_ns":           dropField(fIntervalNS),
 		"no version":               withVersion(0),
 		"repeated known field":     withField(fRunID, []byte("run-2")),
 		"short histogram":          replaceField(fLatencyHist, []byte("AAAAAAAA")), // panics in hdrhistogram.Decode
@@ -153,6 +164,15 @@ func TestSnapshotDecodeRejectsBadInput(t *testing.T) {
 	}
 }
 
+// setVersion rewrites the version, which Encode always writes first.
+func setVersion(b []byte, v uint64) []byte {
+	_, _, n := protowire.ConsumeTag(b)
+	_, m := protowire.ConsumeVarint(b[n:])
+	out := protowire.AppendTag(nil, fVersion, protowire.VarintType)
+	out = protowire.AppendVarint(out, v)
+	return append(out, b[n+m:]...)
+}
+
 func TestSnapshotValidateRejectsInconsistentData(t *testing.T) {
 	for name, mut := range map[string]func(*Snapshot){
 		"bad run id":           func(s *Snapshot) { s.RunID = "run.1" },
@@ -162,6 +182,7 @@ func TestSnapshotValidateRejectsInconsistentData(t *testing.T) {
 		"lag count":            func(s *Snapshot) { s.Intended++ },
 		"send delay count":     func(s *Snapshot) { _ = s.SendDelay.RecordValue(5) },
 		"negative count":       func(s *Snapshot) { s.Unfinished = -1 },
+		"negative interval_ns": func(s *Snapshot) { s.IntervalNS = -1 },
 		"missing histogram":    func(s *Snapshot) { s.SendDelay = nil },
 		"wrong precision":      func(s *Snapshot) { s.DispatchLag = hdrhistogram.New(1, 60_000_000, 2) },
 		"final without reason": func(s *Snapshot) { s.Final = true },

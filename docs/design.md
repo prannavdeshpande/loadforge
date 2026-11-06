@@ -1,6 +1,6 @@
 # LoadForge design
 
-Status: Phase 2 (worker & telemetry) · Last updated: 2026-11-04
+Status: Phase 3b (aggregator & verdict engine) · Last updated: 2026-11-06
 
 ## 1. Goals and non-goals
 
@@ -55,8 +55,16 @@ Postgres holds everything that has to be durable or auditable:
 | `run_events` | Append-only log of state transitions and command acks |
 | `run_workers` | Workers joined to a run, their PREPARE ack data (clock offset, capacity) |
 | `run_seconds` | Per-second merged histogram and counts from the aggregator |
+| `run_snapshots` | Every ingested snapshot, keyed `(run_id, worker_id, seq)` so redelivery is stored once (§4.4) |
+| `snapshot_rejects` | Kafka messages that failed to decode or validate, keyed by `(topic, partition, offset)` |
 | `run_results` | Final merged histogram, percentiles and health summary |
-| `calibration_profiles` | Output of `cmd/calibrate` for each host class |
+| `calibration_profiles` | Output of `cmd/calibrate` for each host class (not created yet) |
+| `schema_migrations` | Applied migrations with their SHA-256, maintained by `store.Migrate` |
+
+- **Migrations** live in `internal/store/migrations/NNNN_name.sql`, numbered without gaps, and are embedded in every binary. `store.Migrate` applies the pending ones under a Postgres advisory lock, each in its own transaction. It refuses to start if an applied migration's checksum no longer matches its file (`ErrMigrationEdited`) or if the database has a version the binary doesn't know (`ErrSchemaTooNew`). `TestShippedMigrationsAreUnchanged` pins every shipped checksum, so an edit fails in CI before it reaches a database.
+- **The schema enforces the verdict rule:** a run has a verdict exactly when it is `COMPLETED` or `ABORTED`, and an `ABORTED` run is always `INVALID`.
+- **`run_events` is append-only**; a trigger rejects `UPDATE` and `DELETE`.
+- **Unmeasured is `NULL`:** `run_workers.clock_offset_ns` and `capacity_rps` stay `NULL` when a worker reports nothing, and the verdict engine treats `NULL` as not VALID.
 
 Run state machine, stored in `runs.state` with every transition written to `run_events`:
 
@@ -65,9 +73,12 @@ PENDING → PREPARING → READY → RUNNING → STOPPING → COMPLETED
     └──────────┴─────────┴────────┴──────────┴────▶ ABORTED
 ```
 
+The legal transitions are defined once, in `internal/runstate`. `store.Transition` checks them inside the fenced transaction that writes the new state and its `run_events` row, and it also requires the run to still be in the `from` state the caller expected (`ErrStateConflict` otherwise). There is no other edge: stopping a run before START means ABORTED.
+
 ### 3.2 Redis holds ephemeral coordination only
-- **Leases:** `lf:lease:run:{run_id}` is set with `SET NX PX 10000`, and its value is the fencing token. The holder renews every 3s.
+- **Leases:** `lf:lease:run:{run_id}` is set with `SET NX PX 10000`, and its value is the fencing token. The holder renews every 3s (`safety.LeaseRenewInterval`), so it survives two failed renewals. Renew and release are Lua compare-and-set scripts: only the holder of the current token can extend or delete the lease. A failed renewal means the lease is lost, and the holder stops at once.
 - **Caches:** worker registry and recent run summaries. All of it can be rebuilt from Postgres.
+- **Live progress:** `lf:progress:run:{run_id}` is a hash the aggregator rewrites after each merge, with `PX 30000`. It holds the run's summed counts so far and the percentiles of the **latest merged second only** (percentiles are never summed or averaged). Every write sets `provisional=true` and `verdict=PENDING`, so progress can never be mistaken for a result: the verdict is only ever read from Postgres. Several aggregators publish the same run, so the write is a Lua script that drops stale progress: a hash with `finalized=true` is never replaced by one without, and otherwise the hash with the higher `snapshots_merged` (the sum over the run's seconds, which only grows) wins. A failed write is logged and ignored.
 - Persistence (AOF and RDB) is off. If Redis restarts, leases are lost and runs pause until a controller takes the lease again. Nothing durable is lost.
 
 ### 3.3 Fencing tokens
@@ -79,6 +90,9 @@ PENDING → PREPARING → READY → RUNNING → STOPPING → COMPLETED
     WHERE id = $1 AND fence_token <= $3;
    ```
    If no rows are updated, the token is stale. The controller must drop the run immediately.
+
+   In `internal/store` every guarded write runs in one transaction that first locks the run's row (`SELECT … FOR UPDATE`), fails with `ErrStaleFence` if the caller's token is lower than `runs.fence_token`, and otherwise raises `runs.fence_token` to the caller's token using the predicate above. Raising it means that once a new controller has written, every older token is rejected. The guarded writes are state transitions, events, PREPARE and STOP acks, marking a worker lost, and requesting finalization.
+   - A worker's `final_seq` is recorded once. A STOP ack with a different value doesn't overwrite it: it is logged as a `protocol_violation` event, which feeds the verdict, and the write returns `ErrProtocolViolation`.
 4. Every NATS command carries the token too. Workers remember the highest token they have seen for each run and reject anything lower, so a controller that paused and came back cannot issue commands.
 
 ## 4. Open-loop timing model
@@ -97,7 +111,9 @@ A closed-loop generator waits for a response before sending the next request. Wh
 ### 4.3 Per-second snapshots
 - Every second a worker swaps its active histogram for a fresh one (double buffering, no lock on the hot path) and publishes a snapshot.
 - Topic: `loadforge.hdr.snapshots`. Key: `{run_id}:{worker_id}`, so each worker's snapshots go in order to one partition.
-- Payload (protobuf, hand-encoded in `internal/transport/snapshot.go`, which holds the field numbers): `version, run_id, worker_id, seq, interval_start, interval_end, latency_hist, lag_hist, send_delay_hist, ok, err, timeout, generator_dropped, intended, unfinished, clamped, final, reason`.
+- Payload (protobuf, hand-encoded in `internal/transport/snapshot.go`, which holds the field numbers): `version, run_id, worker_id, seq, interval_start, interval_end, latency_hist, lag_hist, send_delay_hist, ok, err, timeout, generator_dropped, intended, unfinished, clamped, final, reason, interval_ns`.
+  - The current version is **2**. Version 2 added `interval_ns` (field 19) and requires it; a decoder rejects any other version.
+  - `interval_ns` is the interval's length on the worker's monotonic clock. The worker takes it from the engine's interval before writing the wall-clock labels, which carry no monotonic reading. An interval from a run that never started has length 0.
   - Histograms are HDR V2 compressed (base64, the HDR interchange format) and must cover 1µs–60s at 3 significant digits; a decoder rejects any other range.
   - `intended` is the number of requests released in the interval. The verdict needs it for "dropped ÷ intended" and "achieved ÷ target rate".
   - `interval_start` and `interval_end` are wall-clock unix nanoseconds, used as labels only. A worker computes each label as `wall(t_0) + (monotonic time since t_0)`, so a wall-clock step during a run cannot make labels go backwards or overlap.
@@ -111,9 +127,36 @@ A closed-loop generator waits for a response before sending the next request. Wh
 - The aggregator expects `seq` values to be contiguous for each `(run_id, worker_id)`. A gap is counted as missing seconds.
 - The aggregator merges histograms per second across workers and writes them to `run_seconds`. At the end it merges everything into `run_results`.
 
+### 4.4 Idempotent ingestion
+Kafka delivers at least once. The aggregator writes are safe without a lease because each one is idempotent or monotonic:
+- `run_snapshots` inserts use `ON CONFLICT (run_id, worker_id, seq) DO NOTHING`, and offsets are committed only after the insert commits, so a crash means redelivery and never double-counting.
+- `snapshot_rejects` is deduplicated on `(topic, partition, offset)`. The table has no foreign key to `runs`, so a stray message can't block a partition.
+- A `run_seconds` row is replaced only by a merge of **at least as many** snapshots (`snapshots_merged`). Snapshots never change and only accumulate, so the merge with more inputs is the newer one, and a slow aggregator can't overwrite a fresher merge.
+- `run_results` is written once (`ON CONFLICT DO NOTHING`).
+- `run_snapshots.interval_ns` is the interval's length on the worker's monotonic clock, carried by snapshot field `interval_ns` (§4.3). Summed into `run_seconds.interval_ns_total` and `run_results.interval_ns_total`, it gives worker-seconds of recording without subtracting wall-clock labels. It is **not** the dispatch window: the final interval runs until the drain ends, and the emitter keeps rotating during a long drain, so it includes time in which nothing was intended (§5, §7).
+
+### 4.5 The aggregator (`internal/aggregator`, `cmd/aggregator`)
+**Ingest.** One Kafka consumer group (`loadforge-aggregator`) reads `loadforge.hdr.snapshots`. Offsets are committed only for records marked after their Postgres write committed (`AutoCommitMarks`, with marks committed on revoke and on shutdown), and a rebalance waits until the current poll is handled. A Postgres failure is retried with backoff and never skipped, so the partition waits instead of losing a snapshot. For each record:
+1. Decode the payload (v2, standard histogram ranges, the counter invariants).
+2. Check the key equals `{run_id}:{worker_id}` from the payload.
+3. Check the worker is a member of the run (`run_workers`).
+4. Check the record against the worker's stream: no seq after its final seq (from the STOP ack, else from a stored final snapshot); a final snapshot exactly at the final seq and nowhere else; no final snapshot below a stored seq.
+5. Insert into `run_snapshots`. If the key already exists, compare content: a redelivery is a no-op, a different snapshot under a reused seq is rejected.
+
+A record failing steps 1–5 goes to `snapshot_rejects`, attributed to the run when the key or payload names one. Every reject attributed to a run counts as a protocol violation for it (§5).
+
+**Merging.** Each second the aggregator merges every second of every unfinalized run that has more stored snapshots than its `run_seconds` row was merged from. It merges from Postgres, holding no state of its own, so a restart or several aggregators at once is safe. Workers share the START barrier and the rotation grid, so `seq k` is the same second on every worker.
+
+**Finalization.** A run in `STOPPING`, `COMPLETED` or `ABORTED` with no result is finalized when every member's stream `0..final_seq` is stored, or straight away once the controller has set `finalize_requested`. The finalizer re-merges every second, then merges every snapshot inside each worker's stream into `run_results` (written once).
+- Expected snapshots per worker are `final_seq + 1` when the final seq is known.
+- A worker whose stream never ended (lost, or finalization forced) is expected to have reached the highest seq any member reached. That is a lower bound, so completeness is never overstated.
+- `rejected_snapshots` counts the run's rejects.
+
+**Who writes the verdict.** The aggregator holds no lease, so it never writes `runs`. The controller builds the inputs with `store.VerdictInputs`, calls `health.Evaluate` and moves the run to its terminal state with the verdict and `verdict_detail` in one fenced `Transition`. Before then `run_results` is internal and is never displayed.
+
 ## 5. Verdict engine
 
-Each run gets one verdict, which is the **worst** of its health signals. Thresholds are defaults, can be set per run, and are stored alongside the verdict.
+Each run gets one verdict, which is the **worst** of its health signals. Thresholds are defaults, can be set per run (`runs.thresholds`, a JSON object of `health.Thresholds` keys; `{}` means the defaults), and are stored alongside the verdict. An unknown key or a malformed band (a VALID bound looser than its DEGRADED bound, a ratio outside [0, 1]) is an error, not a silent default. The VALID bounds for drops (0) and completeness (100%) are fixed and cannot be overridden.
 
 | Signal | VALID | DEGRADED | INVALID |
 |---|---|---|---|
@@ -125,6 +168,24 @@ Each run gets one verdict, which is the **worst** of its health signals. Thresho
 | Clock offset spread across workers | ≤ 1 ms | ≤ 5 ms | > 5 ms |
 | Worker lost mid-run | none | n/a | any |
 | Fencing or protocol violation | none | n/a | any |
+
+How each signal is measured (`internal/health`):
+
+| Signal | Measured as | Unmeasured when |
+|---|---|---|
+| Dispatch lag p99 | p99 of the run's merged lag histogram (`run_results.lag_p99_us`) | nothing was released |
+| Achieved ÷ target rate | Σintended ÷ (per-worker rate × Σdispatch window) | **always, for now:** workers do not report their dispatch window (§4.4, §7) |
+| `generator_dropped` ÷ intended | from `run_results` | nothing was released |
+| Snapshot completeness | received ÷ expected snapshots (§4.5) | nothing was expected |
+| Worker CPU p95 | highest p95 across workers | **always, for now:** workers do not report CPU |
+| Clock offset spread | max − min of `run_workers.clock_offset_ns` | any worker's offset is `NULL` (**always, for now**: §6.1) |
+| Worker lost mid-run | any `run_workers.lost` | never |
+| Fencing or protocol violation | `protocol_violation` events plus `snapshot_rejects` attributed to the run | never |
+
+- **Unmeasured is DEGRADED, never VALID**, and `verdict_detail.unmeasured` lists each one. With CPU, clock offset and dispatch window all unreported today, **no run can be VALID yet**: that is the honest result until those signals are measured.
+- With no `run_results` row, every snapshot-derived signal is unmeasured.
+- An `ABORTED` run is INVALID whatever its signals.
+- `verdict_detail` is the full `health.Result`: the verdict, every signal with its value and band, the thresholds used, and the lists of degraded, invalid and unmeasured signals.
 
 - **VALID:** the generator kept to its schedule, so latency reflects the system under test.
 - **DEGRADED:** results are usable but the generator was under strain; the report lists which signals degraded.
@@ -188,6 +249,7 @@ controller                                   workers (all N)
 - Heartbeats carry the fence token. A heartbeat with a token lower than the highest seen is ignored, so it does not count toward keeping the worker running.
 
 ## 7. Open questions
-- Exactly-once versus at-least-once snapshot ingestion: the plan is to dedupe on `(run_id, worker_id, seq)` in Postgres.
+- ~~Exactly-once versus at-least-once snapshot ingestion~~: resolved, at-least-once with deduplication in Postgres (§4.4).
 - Clock-sync requirement for workers (chrony on the host versus measuring the offset at PREPARE).
 - Whether DEGRADED thresholds should come from each host's calibration profile.
+- **Achieved ÷ target rate needs a dispatch window.** Σ`interval_ns` includes the drain after the last release, so a target that stalls at the end would read as a generator falling short. And because the engine never skips a request, Σintended always matches the schedule's count for the window that was dispatched, so the ratio as specified can only detect a dispatcher cut off early. Until this is decided, the signal is unmeasured (DEGRADED). One option is for each snapshot to carry the part of its interval during which the dispatcher was scheduling.

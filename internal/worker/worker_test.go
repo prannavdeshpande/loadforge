@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -144,29 +145,35 @@ func expectStatus(t *testing.T, a transport.Ack, want transport.AckStatus) {
 
 // heartbeats publishes the controller heartbeat for runID until the test
 // ends or the returned function is called.
-func (h *harness) heartbeats(runID string, fence uint64) (stop func()) {
-	done := make(chan struct{})
+// heartbeats publishes heartbeats every testHeartbeat until stop is
+// called. stop returns when no more can be sent, with the time the last one
+// was published (zero if none was).
+func (h *harness) heartbeats(runID string, fence uint64) (stop func() time.Time) {
+	done, exited := make(chan struct{}), make(chan struct{})
+	var last time.Time // written by the goroutine, read after it exits
 	go func() {
+		defer close(exited)
 		tk := time.NewTicker(testHeartbeat)
 		defer tk.Stop()
 		b, _ := json.Marshal(transport.Heartbeat{RunID: runID, FenceToken: fence})
 		for {
 			select {
 			case <-tk.C:
-				_ = h.nc.Publish(transport.RunHeartbeatSubject(runID), b)
+				if h.nc.Publish(transport.RunHeartbeatSubject(runID), b) == nil {
+					last = time.Now()
+				}
 			case <-done:
 				return
 			}
 		}
 	}()
-	var stopped bool
-	stop = func() {
-		if !stopped {
-			stopped = true
-			close(done)
-		}
+	var once sync.Once
+	stop = func() time.Time {
+		once.Do(func() { close(done) })
+		<-exited
+		return last
 	}
-	h.t.Cleanup(stop)
+	h.t.Cleanup(func() { stop() })
 	return stop
 }
 
@@ -407,11 +414,16 @@ func TestDeadManStopsLoadWithoutHeartbeats(t *testing.T) {
 	if snaps := h.pub.delivered(); len(snaps) > 0 && snaps[len(snaps)-1].Final {
 		t.Fatal("run stopped despite heartbeats")
 	}
-	stopHB()
-	stoppedAt := time.Now()
+	// Measure from the last heartbeat actually sent, which can be up to
+	// testHeartbeat before stopHB returns. The worker receives it no
+	// earlier, so its switch must not fire sooner than testDeadMan after.
+	lastHB := stopHB()
+	if lastHB.IsZero() {
+		t.Fatal("no heartbeat was sent")
+	}
 	snaps := h.waitFinal(5 * time.Second)
 	checkStream(t, snaps, transport.ReasonDeadman)
-	if d := time.Since(stoppedAt); d < testDeadMan {
+	if d := time.Since(lastHB); d < testDeadMan {
 		t.Errorf("stopped %v after the last heartbeat, before the %v timeout", d, testDeadMan)
 	}
 	// Late STOP from a controller that comes back still gets the final seq.
