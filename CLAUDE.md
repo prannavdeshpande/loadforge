@@ -15,7 +15,7 @@ We use plain Go and Docker commands; there is no Makefile.
 | Stop stack | `docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans` (**deletes its volumes**) |
 | Stub target | `go run ./cmd/calibrate serve -addr :8080 -latency 1ms`; stall it with `curl -X POST 'localhost:8080/_stall?d=2s'` |
 
-Run the timing tests on an otherwise idle machine. They assert on dispatch lag, and a parallel build can starve the scheduler and fail them.
+Run the timing tests on an otherwise idle machine. They assert on dispatch lag, and a parallel build can starve the scheduler and fail them. For a result you can trust (and what CI runs), compile first and then run one package at a time: `go test -race -count=1 -run '^$' ./... && go test -race -count=1 -p 1 ./...`; for integration, `go test -race -count=1 -p 1 -tags=integration -run '^TestIntegration' ./...` (the integration build otherwise re-runs every unit test). Never re-run a failed timing test until it passes: that hides a real coordinated-omission regression.
 
 ## Workflow
 

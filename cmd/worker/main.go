@@ -1,12 +1,13 @@
 // Command worker generates open-loop load and emits per-second HDR snapshots.
 //
-//	worker -id w1 -max-rate 5000 [-nats nats://localhost:4222] [-kafka localhost:9092]
+//	worker -id w1 -max-rate 5000 [-profile profile.json] [-nats nats://localhost:4222] [-kafka localhost:9092]
 package main
 
 import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/loadforge/loadforge/internal/calibrate"
 	"github.com/loadforge/loadforge/internal/safety"
 	"github.com/loadforge/loadforge/internal/worker"
 )
@@ -32,10 +34,24 @@ func run() error {
 	natsURL := flag.String("nats", nats.DefaultURL, "NATS server URL")
 	brokers := flag.String("kafka", "localhost:9092", "comma-separated Kafka bootstrap brokers")
 	shutdown := flag.Duration("shutdown-timeout", 30*time.Second, "how long SIGTERM waits for the run to drain before aborting it")
+	profilePath := flag.String("profile", "", "calibration profile from `calibrate run -out` for this host; without it, capacity is reported unmeasured")
 	flag.Parse()
 	if *id == "" || *maxRate <= 0 {
 		flag.Usage()
 		return errors.New("worker: -id and a positive -max-rate are required")
+	}
+
+	var capacity float64
+	if *profilePath != "" {
+		p, err := calibrate.LoadForThisHost(*profilePath)
+		if err != nil {
+			return err
+		}
+		if p.CapacityRPS <= 0 {
+			return fmt.Errorf("worker: profile %s: this host sustained no rate within the VALID bounds; it must not generate load", *profilePath)
+		}
+		capacity = p.CapacityRPS
+		log.Printf("worker %s: calibrated capacity %v req/s (host class %s, measured %s)", *id, capacity, p.HostClass, p.MeasuredAt.Format(time.RFC3339))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -67,7 +83,7 @@ func run() error {
 	}
 	defer nc.Close()
 
-	w, err := worker.New(worker.Config{ID: *id, RateCap: safety.RateCap(*maxRate)}, nc, pub)
+	w, err := worker.New(worker.Config{ID: *id, RateCap: safety.RateCap(*maxRate), CapacityRPS: capacity}, nc, pub)
 	if err != nil {
 		return err
 	}

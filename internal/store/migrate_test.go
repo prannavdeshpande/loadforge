@@ -14,6 +14,7 @@ import (
 var appliedChecksums = map[int]string{
 	1: "493a6c0dc0565f5d41bbf7da01221f001591c35658fedd1b803690cca2e6972d", // 0001_init
 	2: "e6148d80ff015004b89c7e36fcdd4c0f2fc2a3ee31653a7997a5883a92141e99", // 0002_stop_requested
+	3: "44cfc60bdd5cb72513b9c511676ff6ad3b58c22ce7a0b1fcabd29d52b6fe793f", // 0003_calibration_profiles
 }
 
 func TestShippedMigrationsAreUnchanged(t *testing.T) {

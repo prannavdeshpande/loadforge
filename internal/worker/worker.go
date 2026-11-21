@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -23,6 +24,10 @@ import (
 type Config struct {
 	ID      string
 	RateCap safety.RateCap
+	// CapacityRPS is this host's calibrated capacity (cmd/calibrate,
+	// design.md §9); 0 means uncalibrated. A PREPARE above it is refused,
+	// like one above RateCap, and the PREPARE ack reports it.
+	CapacityRPS float64
 
 	// Zero values take the defaults below. Tests shorten them.
 	DeadManTimeout    time.Duration // safety.DeadManTimeout
@@ -123,6 +128,9 @@ func New(cfg Config, nc *nats.Conn, pub Publisher) (*Worker, error) {
 		return nil, err
 	}
 	cfg.setDefaults()
+	if cfg.CapacityRPS < 0 || math.IsNaN(cfg.CapacityRPS) || math.IsInf(cfg.CapacityRPS, 0) {
+		return nil, fmt.Errorf("worker: calibrated capacity %v must be a non-negative finite number", cfg.CapacityRPS)
+	}
 	if cfg.DeadManTimeout >= safety.LeaseTTL {
 		return nil, fmt.Errorf("worker: dead-man timeout %v must be below the lease TTL %v", cfg.DeadManTimeout, safety.LeaseTTL)
 	}
@@ -284,6 +292,9 @@ func (w *Worker) engineConfig(p *transport.Prepare) (engine.Config, error) {
 	if err := w.cfg.RateCap.Check(p.Rate); err != nil {
 		return engine.Config{}, err
 	}
+	if c := w.cfg.CapacityRPS; c > 0 && p.Rate > c {
+		return engine.Config{}, fmt.Errorf("rate %v req/s exceeds this worker's calibrated capacity of %v req/s", p.Rate, c)
+	}
 	cfg := engine.Config{
 		Rate:           p.Rate,
 		Duration:       time.Duration(p.DurationMS) * time.Millisecond,
@@ -371,7 +382,12 @@ func (w *Worker) prepare(msg *nats.Msg, r *run, c *transport.Command, warm *warm
 	r.phase = phasePrepared
 	w.active = r
 	log.Printf("worker %s: run %s prepared, %d warm connections to %s", w.cfg.ID, r.id, warm.size(), warm.addr)
-	w.reply(msg, r, c, w.ack(c, transport.StatusReady))
+	ready := w.ack(c, transport.StatusReady)
+	if w.cfg.CapacityRPS > 0 {
+		capacity := w.cfg.CapacityRPS
+		ready.CapacityRPS = &capacity // measured; nil (unmeasured) when uncalibrated
+	}
+	w.reply(msg, r, c, ready)
 	return true
 }
 
