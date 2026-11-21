@@ -1,6 +1,6 @@
 # LoadForge design
 
-Status: Phase 3b (aggregator & verdict engine) · Last updated: 2026-11-06
+Status: Phase 4 (control plane) · Last updated: 2026-11-21
 
 ## 1. Goals and non-goals
 
@@ -51,8 +51,8 @@ Postgres holds everything that has to be durable or auditable:
 
 | Table | Purpose |
 |---|---|
-| `runs` | Run config, current state, `fence_token`, verdict |
-| `run_events` | Append-only log of state transitions and command acks |
+| `runs` | Run config, current state, `fence_token`, verdict, `finalize_requested`, `stop_requested_at` (migration 0002, §8.5) |
+| `run_events` | Append-only log of state transitions, commands (logged before they are sent, §3.3), acks, stop requests and recoveries |
 | `run_workers` | Workers joined to a run, their PREPARE ack data (clock offset, capacity) |
 | `run_seconds` | Per-second merged histogram and counts from the aggregator |
 | `run_snapshots` | Every ingested snapshot, keyed `(run_id, worker_id, seq)` so redelivery is stored once (§4.4) |
@@ -79,7 +79,8 @@ The legal transitions are defined once, in `internal/runstate`. `store.Transitio
 - **Leases:** `lf:lease:run:{run_id}` is set with `SET NX PX 10000`, and its value is the fencing token. The holder renews every 3s (`safety.LeaseRenewInterval`), so it survives two failed renewals. Renew and release are Lua compare-and-set scripts: only the holder of the current token can extend or delete the lease. A failed renewal means the lease is lost, and the holder stops at once.
 - **Caches:** worker registry and recent run summaries. All of it can be rebuilt from Postgres.
 - **Live progress:** `lf:progress:run:{run_id}` is a hash the aggregator rewrites after each merge, with `PX 30000`. It holds the run's summed counts so far and the percentiles of the **latest merged second only** (percentiles are never summed or averaged). Every write sets `provisional=true` and `verdict=PENDING`, so progress can never be mistaken for a result: the verdict is only ever read from Postgres. Several aggregators publish the same run, so the write is a Lua script that drops stale progress: a hash with `finalized=true` is never replaced by one without, and otherwise the hash with the higher `snapshots_merged` (the sum over the run's seconds, which only grows) wins. A failed write is logged and ignored.
-- Persistence (AOF and RDB) is off. If Redis restarts, leases are lost and runs pause until a controller takes the lease again. Nothing durable is lost.
+- **Heartbeat gate.** A controller publishes a run's heartbeat only while `time.Since(send time of the last confirmed renewal) < G`, with `G = LeaseTTL − DeadManTimeout − 1s = 4s` (`controlplane.Config.HeartbeatGate`). The renewal's `PEXPIRE` lands after it was sent, so the lease cannot expire before that send time + 10s; the last heartbeat goes out before + 4s, and workers trip before + 9s. Workers therefore always stop before another controller can take the lease. One failed renewal leaves a 2s heartbeat gap (the next confirmation comes 6s after the last), well inside the dead-man timeout; two consecutive failures stop the run. `Config.Validate` enforces `G + DeadManTimeout < LeaseTTL` and `G > LeaseRenewInterval`.
+- Persistence (AOF and RDB) is off. If Redis restarts, every lease is lost: each holder's next renewal is refused, it stops heartbeats and gives the run up, the workers' dead-man's switches stop the load, and the orphan sweep (§8.6) records the runs ABORTED / INVALID. Runs in flight are lost as measurements, but nothing durable is lost or corrupted.
 
 ### 3.3 Fencing tokens
 1. Before taking a lease, the controller runs `SELECT nextval('fence_seq')`. Drawing the token from Postgres means it keeps increasing even if Redis loses everything.
@@ -93,7 +94,9 @@ The legal transitions are defined once, in `internal/runstate`. `store.Transitio
 
    In `internal/store` every guarded write runs in one transaction that first locks the run's row (`SELECT … FOR UPDATE`), fails with `ErrStaleFence` if the caller's token is lower than `runs.fence_token`, and otherwise raises `runs.fence_token` to the caller's token using the predicate above. Raising it means that once a new controller has written, every older token is rejected. The guarded writes are state transitions, events, PREPARE and STOP acks, marking a worker lost, and requesting finalization.
    - A worker's `final_seq` is recorded once. A STOP ack with a different value doesn't overwrite it: it is logged as a `protocol_violation` event, which feeds the verdict, and the write returns `ErrProtocolViolation`.
-4. Every NATS command carries the token too. Workers remember the highest token they have seen for each run and reject anything lower, so a controller that paused and came back cannot issue commands.
+4. **`cmd_seq` survives a change of controller.** Before sending a command the controller appends a fenced `command` event carrying its `cmd_seq` (re-sends of the same command reuse it and log nothing). A controller that takes over a run continues at `MaxCmdSeq + 1`, so a worker never mistakes its STOP for a repeat of an older command, or ignores it as a lower seq.
+5. A controller recovering an orphaned run first appends a `recovered` event with its new token. That raises `runs.fence_token`, so the old holder, if it was only paused, can write nothing more.
+6. Every NATS command carries the token too. Workers remember the highest token they have seen for each run and reject anything lower, so a controller that paused and came back cannot issue commands.
 
 ## 4. Open-loop timing model
 
@@ -185,6 +188,7 @@ How each signal is measured (`internal/health`):
 - **Unmeasured is DEGRADED, never VALID**, and `verdict_detail.unmeasured` lists each one. With CPU, clock offset and dispatch window all unreported today, **no run can be VALID yet**: that is the honest result until those signals are measured.
 - With no `run_results` row, every snapshot-derived signal is unmeasured.
 - An `ABORTED` run is INVALID whatever its signals.
+- **A stream that ended early aborts the run.** If any member's stored final snapshot has reason `deadman` or `shutdown`, that worker stopped generating load before the run's end (for example on a one-way partition that dropped controller heartbeats but not the worker's). The controller then records the run ABORTED / INVALID instead of COMPLETED (`FinalReasons`, §8.4).
 - `verdict_detail` is the full `health.Result`: the verdict, every signal with its value and band, the thresholds used, and the lists of degraded, invalid and unmeasured signals.
 
 - **VALID:** the generator kept to its schedule, so latency reflects the system under test.
@@ -239,17 +243,59 @@ controller                                   workers (all N)
     │   state: COMPLETED → verdict
 ```
 - Any NACK or missed deadline during PREPARE or START aborts the whole run. The run never starts with only some workers.
+- **Deadlines** (production values, `controlplane.DefaultConfig`): PREPARE acks within 10s (warm-up dials with a 5s timeout); START acks by `start_at − 500ms` with `start_at = now + 2s`; STOP acks within `drain_timeout + 30s + 2s`, the 30s being the worker's budget to deliver its final snapshot before acking. A missed STOP deadline aborts the run too (§8.1).
+- **Re-sends.** Every member subscribes to the same subject, so the controller re-publishes an unacked command to all of them, every 500ms doubling to at most 4s, with the **same `cmd_seq`**. A worker that already answered replays its cached ack, which the controller drops as a duplicate.
+- `start_at` is the only wall-clock value the controller produces. It takes one `time.Now()` reading and derives both the wall-clock barrier and the run's end on its monotonic clock (`t_0 + duration`).
 - `final_seq` in the STOP ack tells the aggregator exactly when a worker's stream is complete.
 
 ### 6.3 Dead-man's switch
 - **Worker side:** if a worker goes 5s without a controller heartbeat for its run (`DeadManTimeout`), it stops dispatching, drains, publishes a final snapshot marked `final=true, reason=deadman`, and leaves the run. The switch is armed at PREPARE, and once it trips it stays tripped.
 - **Stopping gracefully** (STOP, dead-man, SIGTERM): requests intended before the stop are still released, including any the dispatcher is behind on. Queued and in-flight requests then drain for up to `drain_timeout`, so a stall in progress at the stop is still measured.
 - **Invariant:** `DeadManTimeout (5s) < lease TTL (10s)`. Workers stop before a new controller can take the lease, so two controllers can never be driving load for the same run.
-- **Controller side:** a worker silent for 5s is marked lost. The controller sends STOP to the rest and the run's verdict is **INVALID**.
+- **Controller side:** a worker silent for 5s on `lf.worker.<id>.hb`, or naming another run there, is marked lost while the run is between PREPARING and the end of STOP. The controller sends STOP to the rest and records the run ABORTED with verdict **INVALID** (§8.3).
+- The controller publishes heartbeats only while the heartbeat gate is open (§3.2). If more than `DeadManTimeout − 1s` passes without one being published while the run is live, it assumes the workers may have tripped and aborts the run.
 - Heartbeats carry the fence token. A heartbeat with a token lower than the highest seen is ignored, so it does not count toward keeping the worker running.
 
 ## 7. Open questions
+- **Recovering a run that only needed its verdict.** A run found orphaned in STOPPING with every `final_seq` recorded is aborted (§8.6), although its data may be complete. Resuming finalization and computing the real verdict is possible but would need every recorded ack re-checked; deferred.
 - ~~Exactly-once versus at-least-once snapshot ingestion~~: resolved, at-least-once with deduplication in Postgres (§4.4).
 - Clock-sync requirement for workers (chrony on the host versus measuring the offset at PREPARE).
 - Whether DEGRADED thresholds should come from each host's calibration profile.
 - **Achieved ÷ target rate needs a dispatch window.** Σ`interval_ns` includes the drain after the last release, so a target that stalls at the end would read as a generator falling short. And because the engine never skips a request, Σintended always matches the schedule's count for the window that was dispatched, so the ratio as specified can only detect a dispatcher cut off early. Until this is decided, the signal is unmeasured (DEGRADED). One option is for each snapshot to carry the part of its interval during which the dispatcher was scheduling.
+
+## 8. Control plane (`internal/controlplane`, `cmd/controlplane`)
+
+`cmd/controlplane` only parses flags (`-pg`, `-redis`, `-nats`, `-listen`, and the required safety limits `-max-rate-per-worker`, `-max-total-rate`, `-max-duration`, `-max-workers`), runs migrations and wires the dependencies. Any number of controllers can share one Postgres, Redis and NATS: each run is driven by whichever controller holds its lease.
+
+### 8.1 Run driver
+1. **Create** (`POST /runs`): validate the shape (400), the safety limits (422), and that every listed worker sent a heartbeat within 5s naming no run (409). Then draw a fence token, take the lease, and only then insert the PENDING run, so a run never exists without a lease holder. Renewals start at once.
+2. **PREPARING:** heartbeats start (workers arm their dead-man's switch on PREPARE), then PREPARE `cmd_seq=1`. Each ack is recorded as it arrives (`RecordPrepareAck`). Any NACK, an ack with another status (a protocol violation), or a missed deadline aborts.
+3. **READY**, then START `cmd_seq=2` with the barrier (§6.2). All armed: **RUNNING**.
+4. Wait on the monotonic clock until `t_0 + duration`, or a stop request.
+5. **STOPPING:** STOP with the next `cmd_seq`. Each `stopped` ack's `final_seq` is recorded once (`RecordStopAck`; a contradiction is a protocol violation and the run continues to its now-INVALID verdict). A NACK or a missed deadline aborts. Heartbeats stop once every worker has acked.
+6. **Finalization and verdict** (§8.4), then **COMPLETED** in one fenced write, and the lease is released.
+
+**Abort path** (from any non-terminal state): STOP to every member not already lost (unless the run is PENDING, or a STOP deadline already passed), mark lost workers, set `finalize_requested` if PREPARE was ever sent, and record ABORTED / INVALID. `verdict_detail` is the full health result with `Aborted` set plus `abort_reason`.
+
+**Losing the run:** a refused renewal, a renewal that keeps failing for a whole TTL, or any guarded write returning `ErrStaleFence` or `ErrStateConflict` makes the driver stop heartbeats, send no further command, attempt no further write, and release the lease (a compare-and-delete, harmless if another controller holds it). If the run is still non-terminal, the orphan sweep recovers it (§8.6).
+
+### 8.2 Leases and heartbeats
+Renewal every 3s, heartbeat every 1s gated as in §3.2. Every command, heartbeat and guarded write carries the lease's token.
+
+### 8.3 Worker liveness
+The controller subscribes to `lf.worker.*.hb` and keeps each worker's last receipt time (monotonic) and the run it named. A payload whose `worker_id` does not match its subject is ignored, so one worker cannot keep another alive. Validation uses it to refuse unseen or busy workers; a running driver checks its members every 250ms (§6.3).
+
+### 8.4 Finalization and verdict
+After every STOP ack the driver waits for `run_results`. If the aggregator has not finalized the run on its own within 30s, the driver sets `finalize_requested` and keeps waiting. **A run is never recorded COMPLETED without a result**: an aggregator outage leaves it in STOPPING, with the lease held, until the aggregator is back. Once the result exists, a final snapshot ending `deadman` or `shutdown` aborts the run (§5); otherwise `VerdictInputs` → `health.Evaluate` → `Transition(STOPPING → COMPLETED, verdict, verdict_detail)`.
+
+### 8.5 HTTP API
+| Endpoint | Behaviour |
+|---|---|
+| `POST /runs` | Body: `id` (optional), `workers`, `method`, `target_url`, `rate_per_worker`, `duration_ms`, `max_in_flight`, `queue_depth`, `request_timeout_ms`, `drain_timeout_ms`, `thresholds`. The rate is **per worker**; the stored config is the PREPARE payload. 202 with the run's ID. |
+| `POST /runs/{id}/stop` | 202. Writes `runs.stop_requested_at` **without a fence** (drawing a token would fence out the driver); any controller instance can take it. The driver sees it at once if local, else within 1s by polling, logs a fenced `stop_requested` event, and stops: RUNNING → STOPPING → COMPLETED, or ABORTED before START. 404 unknown, 409 terminal. |
+| `GET /runs/{id}` | State, config, workers, events. **Results only once the run has its verdict**, always carrying it; an INVALID run's numbers are under `diagnostics`, never `results`. |
+| `GET /runs/{id}/live` | The aggregator's Redis progress hash, falling back to `store.RunProgress`. Always `provisional: true, verdict: "PENDING"`, whatever the cache holds; the verdict is only read from Postgres. |
+
+### 8.6 Orphan recovery and shutdown
+- **Orphan sweep**, at startup and every LeaseTTL: each non-terminal run with no lease holder (its controller crashed, or gave the run up after losing its lease) is taken under a new, higher token. The controller writes `recovered`, continues at `MaxCmdSeq + 1`, sends STOP (workers that restarted stay silent, which is tolerated), sets `finalize_requested` and records ABORTED / INVALID. This includes a run found in STOPPING whose STOP acks were all recorded: it is aborted rather than finalized (a deliberate choice, see §7).
+- **SIGTERM:** the controller aborts every run it drives with reason `controller_shutdown` (STOP, then ABORTED / INVALID), within `-shutdown-timeout`.

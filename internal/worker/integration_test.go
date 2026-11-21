@@ -18,6 +18,7 @@ import (
 	"github.com/loadforge/loadforge/internal/engine"
 	"github.com/loadforge/loadforge/internal/kafkatest"
 	"github.com/loadforge/loadforge/internal/stubserver"
+	"github.com/loadforge/loadforge/internal/timingtest"
 	"github.com/loadforge/loadforge/internal/transport"
 )
 
@@ -247,6 +248,9 @@ func TestIntegrationRunWithStallEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs for ~6s")
 	}
+	// Generates real load: never alongside a test that asserts on dispatch
+	// lag (internal/controlplane's whole-system stall test judges it).
+	timingtest.Exclusive(t)
 	stub := stubserver.New(time.Millisecond)
 	srv := httptest.NewServer(stub)
 	defer srv.Close()

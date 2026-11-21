@@ -31,6 +31,7 @@ Run the timing tests on an otherwise idle machine. They assert on dispatch lag, 
 - `cmd/worker`: open-loop load generation, HDR recording, snapshot emission
 - `cmd/aggregator`: consumes snapshots, merges histograms, writes results to Postgres
 - `cmd/calibrate`: measures a host's generator capacity and scheduler jitter baseline
+- `internal/controlplane`: run driver, lease keeper and heartbeat gate, worker liveness, orphan recovery, HTTP API
 - `internal/engine`: scheduler and request execution
 - `internal/stubserver`: HTTP target with configurable latency and injectable stalls, for coordinated-omission tests
 - `internal/health`: generator health signals that feed the verdict engine
