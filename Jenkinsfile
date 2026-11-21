@@ -18,6 +18,7 @@ pipeline {
     // Pinned tools, installed into ./bin by the Tools stage.
     GOLANGCI_LINT_VERSION = 'v1.61.0'
     GOTESTSUM_VERSION     = 'v1.12.0'
+    GOTOOLCHAIN = 'go1.23.0'
   }
 
   // There is no Makefile: these are the commands from CLAUDE.md.
