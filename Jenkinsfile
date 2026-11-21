@@ -86,21 +86,16 @@ pipeline {
     }
 
     // The timing tests assert on dispatch lag (CLAUDE.md: run them on an
-    // otherwise idle machine). So test stages hold a per-node lock, keeping
-    // other LoadForge builds off this agent while they run, and run one
-    // package at a time (-p 1): a parallel build or another package's load
-    // generator starves the scheduler and fails them. Compilation still
-    // runs in parallel first (-run '^$' builds every test binary and runs
-    // no test). Failed tests are never re-run: a retry would hide a real
-    // coordinated-omission regression.
+    // otherwise idle machine). Test stages hold a per-node lock, so no other
+    // LoadForge build runs its tests on this agent at the same time; within
+    // one build, internal/timingtest already lets only one timing test run
+    // at once. Running packages one at a time (-p 1) was measured and did
+    // not reduce failures, so it is not used. Failed tests are never re-run:
+    // a retry would hide a real coordinated-omission regression.
     stage('Unit tests') {
       steps {
         lock(resource: "loadforge-timing-${env.NODE_NAME}") {
-          sh '''
-            mkdir -p reports
-            go test -race -count=1 -run '^$' ./...
-            bin/gotestsum --junitfile reports/unit.xml -- -race -count=1 -p 1 ./...
-          '''
+          sh 'mkdir -p reports && bin/gotestsum --junitfile reports/unit.xml -- -race -count=1 ./...'
         }
       }
       post { always { junit allowEmptyResults: true, testResults: 'reports/unit.xml' } }
@@ -122,9 +117,8 @@ pipeline {
             // previous stage already ran: select the integration tests only.
             sh '''
               mkdir -p reports
-              go test -race -count=1 -tags=integration -run '^$' ./...
               bin/gotestsum --junitfile reports/integration.xml -- \\
-                -race -count=1 -p 1 -timeout 20m -tags=integration -run '^TestIntegration' ./...
+                -race -count=1 -timeout 20m -tags=integration -run '^TestIntegration' ./...
             '''
           }
         }

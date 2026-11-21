@@ -134,7 +134,9 @@ func TestIntegrationMigrationsApplyOnce(t *testing.T) {
 	files, _ := LoadMigrations(Migrations)
 	var n int
 	var sum string
-	if err := pool.QueryRow(ctx, `SELECT count(*), max(checksum) FROM schema_migrations`).Scan(&n, &sum); err != nil {
+	// The newest migration's checksum: by version, not the largest hex string.
+	if err := pool.QueryRow(ctx, `SELECT count(*), (SELECT checksum FROM schema_migrations ORDER BY version DESC LIMIT 1)
+		FROM schema_migrations`).Scan(&n, &sum); err != nil {
 		t.Fatal(err)
 	}
 	if n != len(files) || sum != files[len(files)-1].Checksum {

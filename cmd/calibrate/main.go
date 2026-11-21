@@ -127,6 +127,11 @@ func run(args []string) error {
 		log.Printf("calibrate: %8.0f req/s  lag p99 %6dµs  dropped %d  cpu %5.1f%%  %s", s.RatePerSec, s.LagP99US, s.Dropped, s.CPUPercent, verdict)
 	}
 	log.Printf("calibrate: jitter p50/p99/p999/max = %d/%d/%d/%dµs; capacity %v req/s", p.Jitter.P50US, p.Jitter.P99US, p.Jitter.P999US, p.Jitter.MaxUS, p.CapacityRPS)
+	if p.Jitter.P99US > p.Limits.LagP99US {
+		log.Printf("calibrate: WARNING: the idle jitter baseline (p99 %dµs) already exceeds the VALID dispatch-lag bound (%dµs): "+
+			"this host adds that much lag to every schedule, so no rate can be VALID here (a virtualised or shared host, timer resolution?)",
+			p.Jitter.P99US, p.Limits.LagP99US)
+	}
 	if p.Steps[len(p.Steps)-1].Passed {
 		log.Printf("calibrate: every step passed: capacity is at least -max-rate; raise it to measure further")
 	}
