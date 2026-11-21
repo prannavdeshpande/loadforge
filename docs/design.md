@@ -42,7 +42,7 @@ Status: Phase 4 (control plane) · Last updated: 2026-11-21
 | controlplane | Run lifecycle, command issuing, verdicts | Postgres, Redis, NATS |
 | worker | Open-loop scheduling, HDR recording, local safety | NATS, Kafka, system under test |
 | aggregator | Merging snapshots, completeness tracking, result rows | Kafka, Postgres |
-| calibrate | Per-host capacity and jitter baseline | Postgres (writes the calibration profile) |
+| calibrate | Per-host capacity and jitter baseline (§9) | Postgres (optional, `calibration_profiles`), a profile file the worker loads |
 
 ## 3. Storage: two kinds of state
 
@@ -58,7 +58,7 @@ Postgres holds everything that has to be durable or auditable:
 | `run_snapshots` | Every ingested snapshot, keyed `(run_id, worker_id, seq)` so redelivery is stored once (§4.4) |
 | `snapshot_rejects` | Kafka messages that failed to decode or validate, keyed by `(topic, partition, offset)` |
 | `run_results` | Final merged histogram, percentiles and health summary |
-| `calibration_profiles` | Output of `cmd/calibrate` for each host class (not created yet) |
+| `calibration_profiles` | Output of `cmd/calibrate` (migration 0003): one append-only row per calibration; the latest `measured_at` per host class wins (§9) |
 | `schema_migrations` | Applied migrations with their SHA-256, maintained by `store.Migrate` |
 
 - **Migrations** live in `internal/store/migrations/NNNN_name.sql`, numbered without gaps, and are embedded in every binary. `store.Migrate` applies the pending ones under a Postgres advisory lock, each in its own transaction. It refuses to start if an applied migration's checksum no longer matches its file (`ErrMigrationEdited`) or if the database has a version the binary doesn't know (`ErrSchemaTooNew`). `TestShippedMigrationsAreUnchanged` pins every shipped checksum, so an edit fails in CI before it reaches a database.
@@ -220,7 +220,8 @@ Every command carries `{run_id, cmd_seq, fence_token, deadline}`. Every ack carr
   - Requests go directly to the target with no HTTP proxy, because the warm connections do.
 - **RATE** is not implemented yet. Workers NACK it with `detail=unsupported`, which aborts the run.
 - **There is no ABORT command.** The controller aborts by sending STOP and recording ABORTED itself. A worker that receives SIGTERM stops gracefully, with `reason=shutdown`.
-- **Clock offset and capacity** in the PREPARE ack are `null`, meaning unmeasured. The verdict engine must not count an unmeasured signal as VALID.
+- **Clock offset** in the PREPARE ack is `null`, meaning unmeasured. The verdict engine must not count an unmeasured signal as VALID.
+- **Capacity** in the PREPARE ack is the worker's calibrated capacity when it was started with `-profile` (§9), and `null` (unmeasured) otherwise. A calibrated worker NACKs a PREPARE whose per-worker rate exceeds it, exactly as it NACKs one above its rate cap.
 
 ### 6.2 Barrier sequence
 ```
@@ -260,7 +261,8 @@ controller                                   workers (all N)
 - **Recovering a run that only needed its verdict.** A run found orphaned in STOPPING with every `final_seq` recorded is aborted (§8.6), although its data may be complete. Resuming finalization and computing the real verdict is possible but would need every recorded ack re-checked; deferred.
 - ~~Exactly-once versus at-least-once snapshot ingestion~~: resolved, at-least-once with deduplication in Postgres (§4.4).
 - Clock-sync requirement for workers (chrony on the host versus measuring the offset at PREPARE).
-- Whether DEGRADED thresholds should come from each host's calibration profile.
+- Whether DEGRADED thresholds should come from each host's calibration profile. Profiles now exist (§9), but no threshold reads them yet.
+- **Worker CPU p95** is still unmeasured: workers do not report CPU during a run. The next step is a per-snapshot CPU figure (snapshot version 3), judged against the calibrated headroom.
 - **Achieved ÷ target rate needs a dispatch window.** Σ`interval_ns` includes the drain after the last release, so a target that stalls at the end would read as a generator falling short. And because the engine never skips a request, Σintended always matches the schedule's count for the window that was dispatched, so the ratio as specified can only detect a dispatcher cut off early. Until this is decided, the signal is unmeasured (DEGRADED). One option is for each snapshot to carry the part of its interval during which the dispatcher was scheduling.
 
 ## 8. Control plane (`internal/controlplane`, `cmd/controlplane`)
@@ -299,3 +301,22 @@ After every STOP ack the driver waits for `run_results`. If the aggregator has n
 ### 8.6 Orphan recovery and shutdown
 - **Orphan sweep**, at startup and every LeaseTTL: each non-terminal run with no lease holder (its controller crashed, or gave the run up after losing its lease) is taken under a new, higher token. The controller writes `recovered`, continues at `MaxCmdSeq + 1`, sends STOP (workers that restarted stay silent, which is tolerated), sets `finalize_requested` and records ABORTED / INVALID. This includes a run found in STOPPING whose STOP acks were all recorded: it is aborted rather than finalized (a deliberate choice, see §7).
 - **SIGTERM:** the controller aborts every run it drives with reason `controller_shutdown` (STOP, then ABORTED / INVALID), within `-shutdown-timeout`.
+
+## 9. Calibration (`internal/calibrate`, `cmd/calibrate run`)
+
+A profile records what one host can generate while staying within the verdict engine's **VALID** bounds, so a worker never accepts a rate at which its own measurement would degrade.
+
+```
+calibrate run -host-class NAME [-out profile.json] [-pg DSN] [-target URL]
+```
+
+1. **Jitter baseline.** The real engine, with the HTTP client a worker uses, runs at 100 req/s for 20s on the idle generator. Dispatch lag p50 / p99 / p999 / max is what the host adds to every schedule before any load.
+2. **Capacity ramp.** 500, 1000, 2000, … req/s (`-start-rate`, `-factor`, up to `-max-rate`), 10s per step, with a 2s pause between measurements. A step passes only if dispatch-lag p99 ≤ 1ms, `generator_dropped` = 0 and process CPU ≤ 70%: the VALID bounds of §5. The ramp stops at the first failing step. **Capacity is the last passing rate**, never interpolated, and 0 if the first step failed. If every step passed, capacity is at least `-max-rate` and the output says so.
+3. **CPU** is the process's user + system time (`getrusage`) over the step, including its drain, divided by wall time × GOMAXPROCS. It is only measured on unix; elsewhere calibration fails rather than leave the CPU limit unjudged.
+4. **Target.** By default a zero-latency stub runs in the same process on loopback. It shares the CPU with the generator, so capacity is **conservative**. `-target URL` calibrates against an external stub (`calibrate serve`) instead; the profile records which.
+
+**The profile** (JSON, `MethodVersion` 1) holds the host class, hostname, CPU count, GOMAXPROCS, Go version, target, jitter, limits, every step and `measured_at`. It is written to `-out` and/or appended to `calibration_profiles`. `MethodVersion` changes whenever the method does, and a worker refuses a profile with another version.
+
+**Workers** load a profile with `-profile`. A worker refuses to start if the profile was measured with a different CPU count or GOMAXPROCS, or if its capacity is 0 (that host cannot generate load within the VALID bounds). Otherwise it reports the capacity in every PREPARE ack (`run_workers.capacity_rps`, shown by `GET /runs/{id}`) and NACKs any rate above it (§6.1). Without a profile, capacity stays `null` and only the rate cap applies.
+
+Calibrate on an otherwise idle host: anything else using its CPU lowers the measured capacity.
