@@ -15,7 +15,20 @@ We use plain Go and Docker commands; there is no Makefile.
 | Stop stack | `docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans` (**deletes its volumes**) |
 | Stub target | `go run ./cmd/calibrate serve -addr :8080 -latency 1ms`; stall it with `curl -X POST 'localhost:8080/_stall?d=2s'` |
 
-Run the timing tests on an otherwise idle machine. They assert on dispatch lag, and a parallel build can starve the scheduler and fail them. Running packages one at a time (`-p 1`) did not reduce failures when measured (5 runs each way, WSL2 host): load you cannot see from Linux fails them too, so use an otherwise idle machine (CI holds a per-node lock). For integration, `go test -race -count=1 -tags=integration -run '^TestIntegration' ./...` skips re-running every unit test (what CI runs). Never re-run a failed timing test until it passes: that hides a real coordinated-omission regression.
+Run the timing tests on an otherwise idle machine. They assert on dispatch lag, and a parallel build, another process, or a host that swaps (a small WSL2 VM, say) can starve the scheduler and fail them. While a timing test holds the `internal/timingtest` lock, a host-stall monitor samples the scheduler every 1ms; if the test fails it logs `timingtest: host-stall monitor: longest scheduler gap …`. A gap of tens of milliseconds or more around the failed measurement means the host stalled the test, not the code; it never changes a pass or a fail. Whether running packages one at a time (`-p 1`) helps is not established: the one measurement so far ran alongside a CI build on the same VM. For integration, `go test -race -count=1 -tags=integration -run '^TestIntegration' ./...` skips re-running every unit test (what CI runs). Never re-run a failed timing test until it passes: that hides a real coordinated-omission regression.
+
+## CI (Jenkins)
+
+`loadforge-ci` is a single Pipeline job (not multibranch) defined by `Jenkinsfile`. Its `BRANCH` parameter picks the branch to build (blank means `main`); images are pushed only for `main`.
+
+**One-time job setup**, in this order:
+1. `loadforge-ci` > Configure > Pipeline: Definition **Pipeline script from SCM**, SCM **Git**, Repository URL `https://github.com/prannavdeshpande/loadforge.git`, Branch Specifier **`*/main`** (the only entry: delete any other), Script Path `Jenkinsfile`, **Lightweight checkout unticked**. Save.
+2. **Build Now** once. It builds `main` and registers the `BRANCH` parameter.
+3. From then on, **Build with Parameters** with any branch that exists on origin.
+
+The Jenkinsfile is always read from `main`, and its Checkout stage validates `BRANCH` (`git check-ref-format`), confirms it exists on origin (`git ls-remote`) and checks it out. A Jenkinsfile change on a branch takes effect once merged; try it first with Replay. Never use `*/${BRANCH}` as the Branch Specifier: the parameter does not exist until the Jenkinsfile has been read once, so the build cannot resolve it and keeps building an old revision.
+
+**The agent** must be otherwise idle while tests run. Both test stages hold a per-node lock, fail if any `loadforge-*` container is already running (stop it: `docker compose -p <project> -f deploy/compose/docker-compose.yml stop`), and record CPU/memory/IO pressure, `free -m` and swap counters before and after into the archived `reports/host-stats.txt` (`deploy/ci/host-stats.sh`). The integration stage starts and removes its own compose stack; keep any other stack stopped. A timing failure with rising `pswpin`/`pswpout` or memory pressure `full` totals between `before` and `after`, or a large host-stall monitor gap, is the host, not the code: give the agent more memory (for WSL2, `%UserProfile%\.wslconfig`) rather than re-running.
 
 ## Workflow
 
