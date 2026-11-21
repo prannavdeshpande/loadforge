@@ -16,7 +16,8 @@ import (
 func RunLeaseKey(runID string) string { return "lf:lease:run:" + runID }
 
 // Leases are Redis locks whose value is a fencing token drawn from
-// Postgres. Redis is ephemeral: losing a lease only pauses work, and the
+// Postgres. Redis is ephemeral: losing a lease stops the run it guarded
+// (its workers' dead-man switches end the load), never corrupts data, and the
 // token keeps every write it guards safe (CLAUDE.md rule 3).
 type Leases struct {
 	rdb redis.UniversalClient

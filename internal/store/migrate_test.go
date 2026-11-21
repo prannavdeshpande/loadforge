@@ -13,6 +13,7 @@ import (
 // new migration; never change an existing line.
 var appliedChecksums = map[int]string{
 	1: "493a6c0dc0565f5d41bbf7da01221f001591c35658fedd1b803690cca2e6972d", // 0001_init
+	2: "e6148d80ff015004b89c7e36fcdd4c0f2fc2a3ee31653a7997a5883a92141e99", // 0002_stop_requested
 }
 
 func TestShippedMigrationsAreUnchanged(t *testing.T) {

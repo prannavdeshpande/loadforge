@@ -25,6 +25,16 @@ const (
 	EventWorkerLost        = "worker_lost"
 	EventFinalizeRequested = "finalize_requested"
 	EventProtocolViolation = "protocol_violation" // feeds the INVALID verdict signal
+	// EventCommand is logged, fenced, before a command is sent, so the
+	// highest cmd_seq used for a run survives a change of controller
+	// (design.md §3.3).
+	EventCommand = "command"
+	// EventStopRequested is logged by the driver when it acts on a stop
+	// request from the API.
+	EventStopRequested = "stop_requested"
+	// EventRecovered is the first write of a controller that took over an
+	// orphaned run; it raises the run's fence token past the old holder's.
+	EventRecovered = "recovered"
 )
 
 // NewRun is a run to create. Workers fixes the run's membership.
@@ -46,6 +56,7 @@ type Run struct {
 	Verdict           health.Verdict // empty until terminal
 	VerdictDetail     json.RawMessage
 	FinalizeRequested bool
+	StopRequested     bool // the API asked for the run to stop (migration 0002)
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -111,7 +122,8 @@ func (s *Store) CreateRun(ctx context.Context, r NewRun) error {
 	})
 }
 
-const runColumns = `id, config, thresholds, state, fence_token, coalesce(verdict, ''), verdict_detail, finalize_requested, created_at, updated_at`
+const runColumns = `id, config, thresholds, state, fence_token, coalesce(verdict, ''), verdict_detail, finalize_requested,
+	stop_requested_at IS NOT NULL, created_at, updated_at`
 
 func scanRun(row pgx.Row) (Run, error) {
 	var (
@@ -120,7 +132,7 @@ func scanRun(row pgx.Row) (Run, error) {
 		verdict string
 	)
 	err := row.Scan(&r.ID, &r.Config, &r.Thresholds, &state, &r.FenceToken, &verdict, &r.VerdictDetail,
-		&r.FinalizeRequested, &r.CreatedAt, &r.UpdatedAt)
+		&r.FinalizeRequested, &r.StopRequested, &r.CreatedAt, &r.UpdatedAt)
 	r.State, r.Verdict = runstate.State(state), health.Verdict(verdict)
 	return r, err
 }
@@ -277,6 +289,58 @@ func (s *Store) RequestFinalize(ctx context.Context, runID string, fenceToken ui
 		}
 		return appendEvent(ctx, tx, runID, fenceToken, Event{Kind: EventFinalizeRequested}, "", "")
 	})
+}
+
+// RequestStop records a stop request for a run that is not yet terminal.
+// It is deliberately not fenced: any controller instance may take the
+// request, and drawing a token here would fence out the run's driver. The
+// lease holder acts on it (design.md §8). Repeating it is a no-op. It fails
+// with ErrNotFound for an unknown run and ErrStateConflict for a terminal
+// one.
+func (s *Store) RequestStop(ctx context.Context, runID string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE runs SET stop_requested_at = coalesce(stop_requested_at, now()), updated_at = now()
+		WHERE id = $1 AND state NOT IN ('COMPLETED', 'ABORTED')`, runID)
+	if err != nil {
+		return fmt.Errorf("store: request stop %s: %w", runID, err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: run %s is %s", ErrStateConflict, runID, run.State)
+}
+
+// MaxCmdSeq is the highest cmd_seq in a run's events, 0 if none. Commands
+// are logged before they are sent, so a new controller continues above it
+// and its commands are never mistaken for repeats.
+func (s *Store) MaxCmdSeq(ctx context.Context, runID string) (uint64, error) {
+	var n uint64
+	if err := s.pool.QueryRow(ctx, `SELECT coalesce(max(cmd_seq), 0) FROM run_events WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: max cmd_seq %s: %w", runID, err)
+	}
+	return n, nil
+}
+
+// FinalReasons maps each member whose final snapshot is stored to that
+// snapshot's stop reason.
+func (s *Store) FinalReasons(ctx context.Context, runID string) (map[string]transport.StopReason, error) {
+	rows, err := s.pool.Query(ctx, `SELECT worker_id, reason FROM run_snapshots WHERE run_id = $1 AND final`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("store: final reasons %s: %w", runID, err)
+	}
+	defer rows.Close()
+	out := map[string]transport.StopReason{}
+	for rows.Next() {
+		var w, r string
+		if err := rows.Scan(&w, &r); err != nil {
+			return nil, err
+		}
+		out[w] = transport.StopReason(r)
+	}
+	return out, rows.Err()
 }
 
 // RunWorkers lists a run's members, ordered by worker ID.
